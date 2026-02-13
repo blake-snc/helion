@@ -32,6 +32,7 @@ from .tile_strategy import DeviceLoopState
 from .variable_origin import ArgumentOrigin
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Iterator
 
     import sympy
@@ -44,7 +45,14 @@ if TYPE_CHECKING:
 
 
 class GenerateAST(NodeVisitor, CodegenInterface):
-    def __init__(self, func: HostFunction, config: Config) -> None:
+    def __init__(
+        self,
+        func: HostFunction,
+        config: Config,
+        *,
+        store_transform: "Callable[..., ast.AST] | None" = None,
+        load_transform: "Callable[..., ast.AST] | None" = None,
+    ) -> None:
         # Initialize NodeVisitor first
         NodeVisitor.__init__(self)
 
@@ -59,6 +67,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         )
         self.current_grid_state: DeviceGridState | None = None
         self.next_else_block: list[ast.AST] | None = None
+        self.store_transform = store_transform
+        self.load_transform = load_transform
 
         # Now create device function and initialize CodegenInterface
         self.device_function = DeviceFunction(
@@ -511,13 +521,18 @@ if __name__ == "__main__":
 
 
 def generate_ast(
-    func: HostFunction, config: Config, emit_repro_caller: bool
+    func: HostFunction,
+    config: Config,
+    emit_repro_caller: bool,
+    *,
+    store_transform: "Callable[..., ast.AST] | None" = None,
+    load_transform: "Callable[..., ast.AST] | None" = None,
 ) -> ast.AST:
     with func:
         if len(func.device_ir.phases) > 1:
             if not str(config.pid_type).startswith("persistent"):
                 raise exc.BarrierRequiresPersistent(config.pid_type)
-        codegen = GenerateAST(func, config)
+        codegen = GenerateAST(func, config, store_transform=store_transform, load_transform=load_transform)
         with codegen.device_function:
             for stmt in func.body:
                 codegen.add_statement(codegen.visit(stmt))

@@ -55,6 +55,7 @@ from .node_masking import inductor_masked_value
 from .node_masking import mask_node_inputs
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Iterator
 
     from torch.utils._ordered_set import OrderedSet
@@ -1227,6 +1228,14 @@ class CodegenState(NamedTuple):
     @property
     def config(self) -> Config:
         return self.codegen.device_function.config
+
+    @property
+    def store_transform(self) -> "Callable[..., ast.AST] | None":
+        return self.codegen.store_transform
+
+    @property
+    def load_transform(self) -> "Callable[..., ast.AST] | None":
+        return self.codegen.load_transform
 
     def add_statement(self, statement: ast.AST | str) -> None:
         return self.codegen.add_statement(statement)
