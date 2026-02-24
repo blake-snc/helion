@@ -76,6 +76,38 @@ INDUCTOR_PATCH: dict[str, object] = {
 }
 
 
+# TODO(oulgen): Remove this once DeviceProperties support for TPU is implemented in Inductor.
+@contextlib.contextmanager
+def _patch_reduction_num_splits() -> Iterator[None]:
+    """Patch Reduction.num_splits so it works on devices without DeviceProperties support.
+
+    Inductor's Reduction.num_splits() unconditionally calls DeviceProperties.create(device),
+    which fails for device types like TPU that have no registered device interface.
+    Since Helion already sets split_reductions=False, num_splits would return
+    (ReductionHint.DEFAULT, 1) anyway — we just need to avoid the DeviceProperties call.
+    """
+    from torch._inductor.ir import ReductionHint
+
+    original = Reduction.num_splits
+
+    @staticmethod  # type: ignore[misc]
+    def patched_num_splits(  # type: ignore[no-untyped-def]
+        *args: object,
+        **kwargs: object,
+    ) -> tuple[object, int]:
+        try:
+            # pyrefly: ignore[bad-return, bad-argument-type]
+            return original(*args, **kwargs)
+        except (NotImplementedError, RuntimeError):
+            return ReductionHint.DEFAULT, 1
+
+    Reduction.num_splits = patched_num_splits  # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        Reduction.num_splits = original  # type: ignore[assignment]
+
+
 def prepare_graph_lowerings(graph: torch.fx.Graph) -> None:
     with compile_lock:
         graph_lowering = GraphLowering(
@@ -165,7 +197,7 @@ def prepare_node_lowering(
 
     prior_buffers = len(graph_lowering.buffers)
     input_names: list[str] = []
-    with inductor_config.patch(INDUCTOR_PATCH):
+    with inductor_config.patch(INDUCTOR_PATCH), _patch_reduction_num_splits():
         with node.meta["location"], graph_lowering.set_current_node(node):
             try:
                 result = graph_lowering.call_function(

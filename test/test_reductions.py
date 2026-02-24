@@ -13,10 +13,12 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfCpu
 from helion._testing import skipIfNotTriton
+from helion._testing import skipIfPallas
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfCute
+from helion._testing import xfailIfPallas
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -64,7 +66,7 @@ def reduce_kernel(
     return out
 
 
-@onlyBackends(["triton", "cute"])
+@onlyBackends(["triton", "cute", "pallas"])
 class TestReductions(RefEagerTestBase, TestCase):
     def test_sum_constant_inner_dim(self):
         """Sum over a known-constant inner dimension (e.g., 2) should work.
@@ -85,6 +87,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out, x.sum(-1), rtol=1e-4, atol=1e-4)
 
     @xfailIfCute("layernorm uses multiple reduction patterns")
+    @skipIfPallas("complex layernorm with fp16, not relevant to Pallas")
     @skipIfRefEager("Does not call assert_close")
     @skipIfCpu("fails on Triton CPU backend")
     def test_broken_layernorm(self):
@@ -183,8 +186,12 @@ class TestReductions(RefEagerTestBase, TestCase):
 
     def test_sum_looped(self):
         args = (torch.randn([512, 512], device=DEVICE),)
+        # TPU cannot sub-tile 1D outputs, so use block_size=1 (grid=512,
+        # all programs see the full tensor) with a reduction loop.
+        # On GPU, block_size=2 exercises a multi-program grid.
+        bs = 1 if DEVICE.type == "tpu" else 2
         code, output = code_and_output(
-            sum_kernel, args, block_size=2, reduction_loop=64
+            sum_kernel, args, block_size=bs, reduction_loop=64
         )
         torch.testing.assert_close(output, args[0].sum(-1), rtol=1e-04, atol=1e-04)
 
@@ -201,6 +208,7 @@ class TestReductions(RefEagerTestBase, TestCase):
             )
             torch.testing.assert_close(output, args[1](args[0], dim=-1))
 
+    @xfailIfPallas("Pallas launcher lacks BlockSpec support for looped reductions")
     def test_reduction_loops_integer_values(self):
         """Test that reduction_loops with integer values works (issue #345 fix)."""
 
@@ -253,6 +261,7 @@ class TestReductions(RefEagerTestBase, TestCase):
             layer_norm_reduction, args, block_size=32, reduction_loop=4
         )
 
+    @xfailIfPallas("fp16 var_mean not yet supported on Pallas")
     def test_fp16_var_mean(self):
         @helion.kernel(static_shapes=True)
         def layer_norm_fwd_repro(
@@ -293,6 +302,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result1, result2, rtol=1e-3, atol=1e-3)
 
+    @xfailIfPallas("fp16 math ops not yet supported on Pallas")
     @skipIfTileIR("TileIR does not support log1p")
     def test_fp16_math_ops_fp32_fallback(self):
         """Test that mathematical ops with fp16/bfloat16 inputs now work via fp32 fallback."""
@@ -524,6 +534,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         ref = x.float().sum(0)
         torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-4)
 
+    @xfailIfPallas("argmax not yet supported on Pallas")
     @xfailIfCute("argmax and matmul not supported")
     def test_argmax_on_tile_after_matmul(self):
         """Test that argmax on a tile compiles and runs correctly (indices fix).
@@ -562,6 +573,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         self.assertTrue((result >= 0).all())
 
     @xfailIfCute("barrier and var_mean not supported")
+    @skipIfPallas("barrier and persistent_blocked not supported on Pallas")
     @skipIfCpu("requires persistent_blocked pid_type")
     @skipIfTileIR("TileIR does not support barrier operations")
     def test_reduction_loop_with_multiple_rdims(self):

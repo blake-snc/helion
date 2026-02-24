@@ -374,6 +374,16 @@ def skipUnlessPallas(reason: str) -> Callable[[Callable], Callable]:
     return skipIfFn(lambda: not _has_tpu_pallas(), reason)
 
 
+def skipIfPallas(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test if running on Pallas backend."""
+    return skipIfFn(lambda: _get_backend() == "pallas", reason)
+
+
+def xfailIfPallas(reason: str) -> Callable[[Callable], Callable]:
+    """Mark test xfail when Pallas backend is selected."""
+    return xfailIfFn(lambda: _get_backend() == "pallas", reason)
+
+
 def skipIfCpu(reason: str) -> Callable[[Callable], Callable]:
     """Skip test if running on Triton CPU backend."""
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
