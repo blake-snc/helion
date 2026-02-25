@@ -851,6 +851,15 @@ def sync_object(obj: T) -> T:
     return object_list[0]
 
 
+def all_gather_object(obj: T) -> list[T]:
+    if not dist.is_initialized():
+        return [obj]
+
+    object_list = [None] * dist.get_world_size()
+    dist.all_gather_object(object_list, obj)
+    return object_list  # pyrefly: ignore
+
+
 # This function is copied from triton._testing.do_bench with modification
 # to make sure different ranks run the benchmark for the same number
 # of times.
