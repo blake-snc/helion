@@ -16,13 +16,13 @@ from torch._inductor import dependencies
 from torch._inductor.ir import Buffer
 from torch._inductor.ir import ExternalTritonTemplateBuffer
 from torch._inductor.ir import IRNode
-from torch._inductor.ir import KernelArtifact
+from torch._inductor.ir import KernelSource
 from torch._inductor.ir import Layout
 from torch._inductor.ir import OutputSpec
-from torch._inductor.ir import TemplateKernelMetadata
-from torch._inductor.ir import ResolvedEpilogueSpec
-from torch._inductor.ir import ResolvedPrologueSpec
+from torch._inductor.ir import EpilogueSpec
+from torch._inductor.ir import PrologueSpec
 from torch._inductor.ir import TensorBox
+from torch._inductor.ir import TemplateKernelMetadata
 from torch._inductor.ir import TritonTemplateBuffer
 from torch._inductor.lowering import register_lowering
 from torch._inductor.select_algorithm import PartialRender
@@ -67,81 +67,76 @@ class _CodeExpr(str):
         return str(self)
 
 
-class HelionKernelBackend:
-    """Helion's implementation of the ``ExternalKernelBackend`` protocol.
+class HelionTritonTemplateBuffer(ExternalTritonTemplateBuffer):
+    """Helion's concrete ``ExternalTritonTemplateBuffer`` implementation.
 
-    Pure Helion logic — no Inductor IR node inheritance, no
-    ``TritonTemplateBuffer`` subclassing.  The only Inductor types this class
-    touches are the documented protocol dataclasses (``ResolvedEpilogueSpec``,
-    ``ResolvedPrologueSpec``, ``TemplateKernelMetadata``, ``KernelArtifact``).
-    Inductor handles all call-site emission (argument ordering, ReinterpretView
-    preamble, prologue source substitution) using ``call_order`` and
-    ``constant_repr`` from ``describe()``.
+    Combines the Inductor IR node with Helion's kernel codegen logic by
+    implementing ``describe()`` and ``compile()`` directly — no separate
+    backend object needed.
 
     Lifecycle
     ---------
-    1. ``lower_helion_kernel`` creates a ``HelionKernelBackend`` and calls
-       ``ExternalTritonTemplateBuffer.from_kernel`` to build the IR node.
-    2. Inductor's scheduler queries ``describe()`` to plan fusion; the metadata
-       also carries ``call_order`` / ``constant_repr`` for call-site use.
-    3. ``ExternalTritonTemplateBuffer.codegen_with_fusion`` applies spec expansion
-       (alias fanout, removed-buffer tracking) and calls ``compile()`` with
-       the fully-expanded spec lists.  The returned ``KernelArtifact``
-       (source + imports) is cached.
-    4. ``ExternalTritonTemplateBuffer.call_kernel`` builds the argument list entirely
-       from metadata and realized nodes — no backend involvement.
+    1. ``lower_helion_kernel`` calls ``HelionTritonTemplateBuffer.from_kernel``
+       which builds the IR node and returns ``(buf, outputs)``.
+    2. The caller sets ``buf._metadata`` after computing ``fusable_outputs``
+       (which needs the output-info collected during ``from_kernel``).
+    3. Inductor's scheduler queries ``describe()`` (returns ``_metadata``) to
+       plan fusion.
+    4. ``codegen_with_fusion`` (inherited) applies spec expansion and calls
+       ``compile()``.  The returned ``KernelSource`` (source + imports +
+       call_args + call_preamble) is cached on ``self._artifact``.
+    5. ``call_kernel`` (inherited) emits the call using the cached artifact —
+       no further involvement of this class.
     """
 
     def __init__(
         self,
+        layout: "Layout",
+        inputs: "Sequence[IRNode]",
+        *,
         kernel: "Kernel",
         bound_kernel: "BoundKernel",
-        named_input_nodes: dict[str, IRNode],
         constant_args: dict[str, object],
-        metadata: TemplateKernelMetadata | None,
         autotune_args: tuple[object, ...] | None = None,
+        mutated_inputs: "Optional[Iterable[IRNode]]" = None,
+        allowed_prologue_inps: "Optional[OrderedSet[str]]" = None,
     ) -> None:
         self._kernel = kernel
         self._bound_kernel = bound_kernel
-        self._named_input_nodes = named_input_nodes
         self._constant_args = constant_args
-        self._metadata = metadata
         self._autotune_args = autotune_args
+        self._metadata: TemplateKernelMetadata | None = None
 
-        # Active fusion specs — set at the start of compile() and
-        # read by the AST transform callbacks during _generate_triton_ast.
-        self._active_epilogue_specs: dict[str, ResolvedEpilogueSpec] = {}
-        self._active_prologue_specs: dict[str, ResolvedPrologueSpec] = {}
+        super().__init__(
+            layout=layout,
+            inputs=inputs,
+            mutated_inputs=mutated_inputs,
+            allowed_prologue_inps=allowed_prologue_inps,
+        )
 
     # ------------------------------------------------------------------ #
-    # ExternalKernelBackend protocol                                       #
+    # ExternalTritonTemplateBuffer abstract methods                        #
     # ------------------------------------------------------------------ #
 
     def describe(self) -> TemplateKernelMetadata:
         assert self._metadata is not None, (
-            "HelionKernelBackend.describe() called before metadata was set"
+            "HelionTritonTemplateBuffer.describe() called before metadata was set"
         )
         return self._metadata
 
     def compile(
         self,
-        epilogue_specs: list[ResolvedEpilogueSpec],
-        prologue_specs: dict[str, ResolvedPrologueSpec],
+        epilogue_specs: list[EpilogueSpec],
+        prologue_specs: dict[str, PrologueSpec],
         extra_params: list[tuple[str, str]],
-    ) -> KernelArtifact:
-        """Single codegen API: generate source and imports in one shot.
+    ) -> KernelSource:
+        """Generate source, imports, and the full kernel call-site in one shot.
 
-        Called once by ``ExternalTritonTemplateBuffer.codegen_with_fusion`` with the
-        complete, alias-expanded fusion context.  Call-site argument resolution
-        (which buffers to pass, ReinterpretView preamble, etc.) is handled
-        generically by ``ExternalTritonTemplateBuffer.call_kernel`` using the
-        ``call_order`` and ``constant_repr`` fields of ``TemplateKernelMetadata``.
+        Called once by the inherited ``codegen_with_fusion`` with the complete,
+        alias-expanded fusion context.  Returns source, imports, call_args, and
+        call_preamble so ``call_kernel`` needs no further backend involvement.
         """
-        # 1. Store active specs for AST transform callbacks
-        self._active_epilogue_specs = {s.kernel_output_param: s for s in epilogue_specs}
-        self._active_prologue_specs = dict(prologue_specs)
-
-        # 2. Autotune before AST generation (must fire before fused AST is generated
+        # 1. Autotune before AST generation (must fire before fused AST is generated
         #    so that the autotuned (unfused) code does not contain fusion patterns).
         if (epilogue_specs or prologue_specs) and self._autotune_args and self._bound_kernel:
             self._bound_kernel.ensure_config_exists(self._autotune_args)
@@ -149,7 +144,7 @@ class HelionKernelBackend:
         # 3. Generate Triton AST with store/load transform callbacks active
         root = self._generate_triton_ast()
         if root is None:
-            return KernelArtifact(source="", imports=[])
+            return KernelSource(source="", imports=[])
 
         # 4. Inject extra fusion params (epilogue inputs / redirected outputs)
         if extra_params:
@@ -176,7 +171,55 @@ class HelionKernelBackend:
                 for imp in self._bound_kernel.host_function.global_imports.values()
             )
 
-        return KernelArtifact(source=source, imports=imports)
+        # 7. Compute call args and preamble
+        call_order, constant_repr = self._call_order_and_constant_repr()
+        call_preamble, call_args = self._resolve_call_args(
+            call_order, constant_repr, prologue_specs, extra_params
+        )
+
+        return KernelSource(
+            source=source,
+            imports=imports,
+            call_args=call_args,
+            call_preamble=call_preamble,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Metadata helpers (called by lower_helion_kernel after from_kernel)  #
+    # ------------------------------------------------------------------ #
+
+    def _call_order_and_constant_repr(self) -> tuple[list[str], dict[str, str]]:
+        """Compute the kernel call order and pre-repr'd non-tensor args.
+
+        ``call_order`` lists every parameter name in signature order.
+        ``constant_repr`` maps non-tensor param names to their ``repr()``-ready
+        strings (scalars, defaults, and rebuilt container args) so the inherited
+        ``call_kernel`` can emit them without calling back into this class.
+        """
+        # Both tensor inputs AND constant args must be combined before
+        # _rebuild_container_args so it can pop 'param.0', 'param.1' etc.
+        all_args: dict[str, object] = {
+            n: _CodeExpr(inp.get_name())  # type: ignore[union-attr]
+            for n, inp in self._named_inputs.items()
+        }
+        for n, v in self._constant_args.items():
+            if n not in all_args:
+                all_args[n] = v if n == "__container_specs" else _CodeExpr(repr(v))
+        _rebuild_container_args(all_args)
+
+        tensor_flat_params = frozenset(self._named_inputs.keys())
+        sig = self._kernel.signature.parameters
+        order: list[str] = []
+        const_repr: dict[str, str] = {}
+        for n, p in sig.items():
+            if n in all_args:
+                order.append(n)
+                if n not in tensor_flat_params:
+                    const_repr[n] = repr(all_args[n])
+            elif p.default is not p.empty:
+                order.append(n)
+                const_repr[n] = repr(p.default)
+        return order, const_repr
 
     # ------------------------------------------------------------------ #
     # Private Helion-specific helpers                                      #
@@ -193,7 +236,7 @@ class HelionKernelBackend:
             return None
         # Config must be available before AST generation.
         if self._autotune_args and not (
-            self._active_epilogue_specs or self._active_prologue_specs
+            self._epilogue_specs or self._prologue_specs
         ):
             # Fusion path calls ensure_config_exists at the top of compile();
             # no-fusion path does it here.
@@ -213,10 +256,10 @@ class HelionKernelBackend:
                 cfg,
                 emit_repro_caller=False,
                 store_transform=self._codegen_epilogue_fusion
-                if self._active_epilogue_specs
+                if self._epilogue_specs
                 else None,
                 load_transform=self._codegen_prologue_fusion
-                if self._active_prologue_specs
+                if self._prologue_specs
                 else None,
             )
 
@@ -323,14 +366,14 @@ class HelionKernelBackend:
         generic expression-application logic to
         ``TritonTemplateBuffer.apply_resolved_epilogue_at_store``.
         """
-        assert self._active_epilogue_specs
+        assert self._epilogue_specs
         param_name = state.device_function.tensor_arg(tensor).name
-        spec = self._active_epilogue_specs.get(param_name)
+        spec = self._epilogue_specs.get(param_name)
         if spec is None:
             return value
 
         # Unique per-epilogue name avoids Triton type conflicts across branches.
-        epi_idx = list(self._active_epilogue_specs.keys()).index(param_name)
+        epi_idx = list(self._epilogue_specs.keys()).index(param_name)
         kernel_val_name = f"_kernel_val_{epi_idx}"
 
         # Resolve Helion-specific indexing context for this store site.
@@ -362,9 +405,9 @@ class HelionKernelBackend:
         passed to ``generate_ast``.  Substitutes the ``_load_val`` placeholder
         in the pre-traced fused expression with the actual load AST.
         """
-        assert self._active_prologue_specs
+        assert self._prologue_specs
         param_name = state.device_function.tensor_arg(tensor).name
-        spec = self._active_prologue_specs.get(param_name)
+        spec = self._prologue_specs.get(param_name)
         if spec is None:
             return value
         return TritonTemplateBuffer.apply_resolved_prologue_at_load(spec, value)  # type: ignore[return-value]
@@ -403,23 +446,22 @@ def lower_helion_kernel(
     tensor_args: dict[str, TensorBox],
     output_spec: dict[str, object],
 ) -> tuple[TensorBox, ...]:
-    """Lower a Helion kernel HOP to an ``ExternalTritonTemplateBuffer``.
+    """Lower a Helion kernel HOP to a ``HelionTritonTemplateBuffer``.
 
-    Creates a ``HelionKernelBackend`` (pure Helion logic) and calls
-    ``ExternalTritonTemplateBuffer.from_kernel`` to build the Inductor IR node.
-    Inductor then schedules the buffer and calls into the backend through
-    the ``ExternalKernelBackend`` protocol for fusion planning and codegen.
+    Calls ``HelionTritonTemplateBuffer.from_kernel`` which builds the Inductor
+    IR node and returns ``(buf, outputs)``.  After the multi-output structure
+    is known, sets ``buf._metadata`` so that ``describe()`` can serve it.
+    Inductor then schedules the buffer and calls ``describe()`` / ``compile()``
+    for fusion planning and codegen.
     """
     kernel = get_helion_kernel(kernel_idx)
     mutated_inputs_list = cast("list[str]", output_spec.get("mutated_inputs", []))
 
     # Realize inputs: convert TensorBox → buffer / ReinterpretView.
-    # ExternalTritonTemplateBuffer.realize_template_input is inherited from
-    # TritonTemplateBuffer and preserves MultiOutput layouts.
     realized: dict[str, IRNode] = {}
     for n, tb in tensor_args.items():
         if isinstance(tb, TensorBox):
-            realized[n] = ExternalTritonTemplateBuffer.realize_template_input(tb)
+            realized[n] = HelionTritonTemplateBuffer.realize_template_input(tb)
 
     # Build fake tensors for kernel binding (sympy exprs → concrete ints).
     def as_int(x: object, default: int) -> int:
@@ -445,84 +487,23 @@ def lower_helion_kernel(
     # Derive output structure from the bound kernel using inductor-time layouts.
     flat_leaves, tree_spec, return_ast = _get_flat_output(bound.host_function)
 
-    # Create the backend (pure Helion, no Inductor IR inheritance).
-    backend = HelionKernelBackend(
-        kernel=kernel,
-        bound_kernel=bound,
-        named_input_nodes=dict(realized),
-        constant_args=constant_args,
-        metadata=None,  # set below, after from_kernel populates output_info
-        autotune_args=tuple(fake_tensors),
-    )
-
-    def _param_alias_map() -> dict[str, list[str]]:
-        result: dict[str, list[str]] = {}
-        for p, inp in backend._named_input_nodes.items():
-            result.setdefault(inp.get_name(), []).append(p)  # type: ignore[union-attr]
-        return result
-
-    def _call_order_and_constant_repr() -> tuple[list[str], dict[str, str]]:
-        """Compute the kernel call order and pre-repr'd non-tensor args.
-
-        ``call_order`` lists every parameter name in the order they appear in
-        the kernel call.  ``constant_repr`` maps non-tensor param names to their
-        ``repr()``-ready strings (after pytree container rebuilding), so
-        ``ExternalTritonTemplateBuffer.call_kernel`` can emit constants and rebuilt
-        container args (e.g. ``{'a': buf0, 'b': buf1}`` for a dict-tensor
-        param) without calling back into the backend.
-
-        Container tensor params (e.g. a ``dict[str, Tensor]`` arg) appear in
-        ``constant_repr`` because their repr is a literal dict of buffer names
-        that is reconstructed here via ``_rebuild_container_args``.  Individual
-        tensor elements are keyed as ``param.N`` in ``_named_input_nodes``;
-        regular (non-container) tensor params are handled by Inductor's
-        ``call_kernel`` via the ``_named_inputs`` dict.
-        """
-        # Mirror the combined-dict approach that the old _resolve_call_args used:
-        # both tensor inputs AND constant args must be in all_args before calling
-        # _rebuild_container_args so that it can pop 'param.0', 'param.1' etc.
-        # from tensor inputs and rebuild the container structure.
-        all_args: dict[str, object] = {
-            n: _CodeExpr(inp.get_name())  # type: ignore[union-attr]
-            for n, inp in backend._named_input_nodes.items()
-        }
-        for n, v in backend._constant_args.items():
-            if n not in all_args:
-                all_args[n] = v if n == "__container_specs" else _CodeExpr(repr(v))
-        _rebuild_container_args(all_args)
-
-        # After rebuilding, container tensor params (e.g. 'tensors') are present
-        # in all_args but NOT in _named_input_nodes (which has 'tensors.0', etc.).
-        # Non-container tensor params are in both; Inductor resolves those.
-        tensor_flat_params = frozenset(backend._named_input_nodes.keys())
-        sig = kernel.signature.parameters
-        order: list[str] = []
-        const_repr: dict[str, str] = {}
-        for n, p in sig.items():
-            if n in all_args:
-                order.append(n)
-                if n not in tensor_flat_params:
-                    # Scalar constant, default, or rebuilt container arg.
-                    const_repr[n] = repr(all_args[n])
-            elif p.default is not p.empty:
-                order.append(n)
-                const_repr[n] = repr(p.default)
-        return order, const_repr
-
     if not flat_leaves:
         # No outputs — from_kernel still creates the buffer for mutations.
-        ExternalTritonTemplateBuffer.from_kernel(
-            backend, realized, None, mutated_inputs_list or [], {}
+        buf, _ = HelionTritonTemplateBuffer.from_kernel(
+            realized_inputs=realized,
+            structured_outputs=None,
+            mutated_input_names=mutated_inputs_list or [],
+            direct_aliases={},
+            kernel=kernel,
+            bound_kernel=bound,
+            constant_args=constant_args,
+            autotune_args=tuple(fake_tensors),
         )
-        call_order, constant_repr = _call_order_and_constant_repr()
-        backend._metadata = TemplateKernelMetadata(
-            all_inputs={inp.get_name(): p for p, inp in backend._named_input_nodes.items()},  # type: ignore[union-attr]
+        buf._metadata = TemplateKernelMetadata(
+            all_inputs={inp.get_name(): p for p, inp in buf._named_inputs.items()},  # type: ignore[union-attr]
             fusable_outputs={},
             all_output_names=set(),
             mutated_input_names=mutated_inputs_list or [],
-            param_alias_map=_param_alias_map(),
-            call_order=call_order,
-            constant_repr=constant_repr,
         )
         return ()
 
@@ -555,9 +536,7 @@ def lower_helion_kernel(
         if ast_node is not None and not isinstance(ast_node, ast.Constant):
             has_symbolic_returns_flag[0] = True
 
-    # Inductor handles all IR construction — Helion imports only ExternalTritonTemplateBuffer.
-    result = ExternalTritonTemplateBuffer.from_kernel(
-        backend=backend,
+    buf, result = HelionTritonTemplateBuffer.from_kernel(
         realized_inputs=realized,
         structured_outputs=structured,
         mutated_input_names=mutated_inputs_list or [],
@@ -570,6 +549,10 @@ def lower_helion_kernel(
         },
         on_tensor_leaf=on_tensor_leaf,
         on_non_tensor_leaf=on_non_tensor_leaf,
+        kernel=kernel,
+        bound_kernel=bound,
+        constant_args=constant_args,
+        autotune_args=tuple(fake_tensors),
     )
 
     # Compute fusable_outputs: param known + no symbolic returns + shape matches an input.
@@ -582,15 +565,11 @@ def lower_helion_kernel(
         and (not input_shapes or output_sizes.get(mo_name, ()) in input_shapes)
     }
 
-    call_order, constant_repr = _call_order_and_constant_repr()
-    backend._metadata = TemplateKernelMetadata(
-        all_inputs={inp.get_name(): p for p, inp in backend._named_input_nodes.items()},  # type: ignore[union-attr]
+    buf._metadata = TemplateKernelMetadata(
+        all_inputs={inp.get_name(): p for p, inp in buf._named_inputs.items()},  # type: ignore[union-attr]
         fusable_outputs=fusable_outputs,
         all_output_names=set(output_info),
         mutated_input_names=mutated_inputs_list or [],
-        param_alias_map=_param_alias_map(),
-        call_order=call_order,
-        constant_repr=constant_repr,
     )
 
     return result
